@@ -2,11 +2,15 @@
 import {createInterface} from 'node:readline';
 import {pathToFileURL} from 'node:url';
 const id={type:'string',pattern:'^[A-Za-z0-9-]{1,100}$'};
+// The API refuses command keys under 8 characters; launch keys need 8 only in AWS mode, which
+// the API enforces itself.
+const requestKey={type:'string',pattern:'^[A-Za-z0-9-]{8,100}$'};
+const launchKey={type:'string',pattern:'^[A-Za-z0-9-]{1,100}$'};
 const definitions=[
- ['workers','Inspect worker state, command evidence and fleet limits.',{},[]],
- ['launch','Create a worker from an approved template. AWS mode incurs charges.',{name:{type:'string'},template:{type:'string',enum:['node','python','general']},minutes:{type:'integer',minimum:5,maximum:240},requestKey:id},['name','template','minutes','requestKey']],
+ ['workers','Inspect worker state, command evidence and fleet limits. Pass project to see one factory project.',{project:{type:'string',pattern:'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'}},[]],
+ ['launch','Create a worker from an approved template. AWS mode incurs charges.',{name:{type:'string'},template:{type:'string',enum:['node','python','general']},minutes:{type:'integer',minimum:5,maximum:240},project:{type:'string',pattern:'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'},requestKey:launchKey},['name','template','minutes','requestKey']],
  ['control','Start, stop, reboot or terminate an owned worker.',{workerId:id,action:{type:'string',enum:['start','stop','reboot','terminate']}},['workerId','action']],
- ['execute','Run a reviewed shell command on an owned AWS worker through SSM.',{workerId:id,command:{type:'string',maxLength:7000},requestKey:id},['workerId','command','requestKey']],
+ ['execute','Run a reviewed shell command on an owned AWS worker through SSM.',{workerId:id,command:{type:'string',maxLength:7000},requestKey},['workerId','command','requestKey']],
  ['collect_artifact','Collect a file of at most 12 KiB from the owned worker workspace and retain it locally.',{workerId:id,path:{type:'string',maxLength:512}},['workerId','path']],
  ['command','Refresh or cancel a previously recorded SSM command.',{commandId:id,action:{type:'string',enum:['refresh','cancel']}},['commandId','action']],
 ];
@@ -19,11 +23,12 @@ export function toolList(env=process.env){const {controls}=configuration(env);re
 async function json(response){if(!response.ok)throw Error(`Skidbladnir returned HTTP ${response.status}`);let size=0;const parts=[];for await(const chunk of response.body){size+=chunk.length;if(size>2*1024*1024)throw Error('Result exceeds context limit');parts.push(chunk);}return JSON.parse(Buffer.concat(parts).toString());}
 export async function callTool(name,args={},env=process.env,request=fetch){
  const config=configuration(env),tool=toolList(env).find(t=>t.name===name);if(!tool)throw Error('Unknown tool or controls are disabled.');
+ if(!args||typeof args!=='object'||Array.isArray(args))throw Error('Arguments must be an object.');
  for(const key of tool.inputSchema.required)if(args[key]===undefined)throw Error('Missing '+key);
  for(const key of Object.keys(args))if(!Object.hasOwn(tool.inputSchema.properties,key))throw Error('Unexpected argument '+key);
- for(const key of ['workerId','commandId','requestKey'])if(args[key]!==undefined&&!/^[A-Za-z0-9-]{1,100}$/.test(args[key]))throw Error('Invalid identity');
- let path='/api/snapshot',body={},method='GET';
- if(name==='skidbladnir_launch'){path='/api/workers';body={name:args.name,template:args.template,minutes:args.minutes};method='POST';}
+ for(const key of ['workerId','commandId','requestKey'])if(args[key]!==undefined&&(typeof args[key]!=='string'||!new RegExp(tool.inputSchema.properties[key].pattern).test(args[key])))throw Error('Invalid identity');
+ let path='/api/snapshot'+(args.project!==undefined&&name==='skidbladnir_workers'?'?project='+encodeURIComponent(args.project):''),body={},method='GET';
+ if(name==='skidbladnir_launch'){path='/api/workers';body={name:args.name,template:args.template,minutes:args.minutes,...(args.project!==undefined?{project:args.project}:{})};method='POST';}
  if(name==='skidbladnir_control'){if(!['start','stop','reboot','terminate'].includes(args.action))throw Error('Invalid action');path=`/api/workers/${args.workerId}/${args.action}`;method='POST';}
  if(name==='skidbladnir_execute'){path=`/api/workers/${args.workerId}/commands`;body={command:args.command};method='POST';}
  if(name==='skidbladnir_collect_artifact'){path=`/api/workers/${args.workerId}/artifacts`;body={path:args.path};method='POST';}

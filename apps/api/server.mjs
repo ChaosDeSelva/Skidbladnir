@@ -7,9 +7,9 @@ import { Store } from './store.mjs';
 import { terminal, artifact } from '../../packages/providers/session.mjs';
 import { AwsProvider } from '../../packages/providers/aws.mjs';
 import { Simulator } from '../../packages/providers/simulator.mjs';
-import { workerInput, actions } from '../../packages/contracts/worker.mjs';
+import { workerInput, actions, activeCount, isActive, projectInput, projectSnapshot } from '../../packages/contracts/worker.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-export function createApp({ database = ':memory:', provider = new Simulator() } = {}) {
+export function createApp({ database = ':memory:', provider = new Simulator(), siteDir = resolve(root, 'site') } = {}) {
   const store = new Store(database), streams = new Set();
   store.bind(provider.mode==='aws'?{mode:'aws',accountId:provider.config.accountId,region:provider.config.region,fleetId:provider.config.fleetId}:{mode:'simulation'});
   let providerError=null;
@@ -23,9 +23,9 @@ export function createApp({ database = ':memory:', provider = new Simulator() } 
     let changed = false;
     if(provider.mode==='aws') {
       try {
-        for(const worker of store.list().filter(w=>!['terminated','failed'].includes(w.state))) {
+        for(const worker of store.list().filter(isActive)) {
           const updated=await provider.inspect(worker);
-          if(JSON.stringify(updated)!==JSON.stringify(worker)){store.save(updated,'AWS state reconciled.');changed=true;}
+          if(JSON.stringify(updated)!==JSON.stringify(worker)){store.save(updated,updated.attention??'AWS state reconciled.');changed=true;}
         }
         if(providerError){providerError=null;changed=true;}
       } catch(error){providerError=error.message;changed=true;}
@@ -46,8 +46,11 @@ export function createApp({ database = ':memory:', provider = new Simulator() } 
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     const expectedHost = `127.0.0.1:${server.address()?.port}`;
     if (req.headers.host !== expectedHost || (req.headers.origin && req.headers.origin !== `http://${expectedHost}`) || req.headers['sec-fetch-site'] === 'cross-site') return reply(403,{error:'Local same-origin access only.'});
-    const url = new URL(req.url, `http://${expectedHost}`);
+    // An absolute-form target such as `http://[` is not a valid URL; it must not reject the handler.
+    let url; try { url = new URL(req.url, `http://${expectedHost}`); } catch { return reply(400,{error:'Invalid path.'}); }
     if (url.pathname.startsWith('/api/')) {
+      // Another local port is same-site: it may link to the dashboard but must not call the API.
+      if (!['same-origin','none',undefined].includes(req.headers['sec-fetch-site'])) return reply(403,{error:'Local same-origin access only.'});
       if (req.method === 'GET' && url.pathname === '/api/session') return reply(200,{token});
       if (req.method !== 'GET') {
         const received = Buffer.from(String(req.headers['x-skidbladnir-token'] || ''));
@@ -56,7 +59,7 @@ export function createApp({ database = ':memory:', provider = new Simulator() } 
         if (!String(req.headers['content-type']).startsWith('application/json')) return reply(415,{error:'JSON required.'});
       }
       try {
-        if (req.method === 'GET' && url.pathname === '/api/snapshot') { await expire(); return reply(200,snapshot()); }
+        if (req.method === 'GET' && url.pathname === '/api/snapshot') { const project=projectInput(url.searchParams.get('project')); await expire(); return reply(200,projectSnapshot(snapshot(),project)); }
         if (req.method === 'GET' && url.pathname === '/api/events') {
           res.writeHead(200,{'Content-Type':'text/event-stream','Connection':'keep-alive'});
           streams.add(res); res.write(`event: snapshot\ndata: ${JSON.stringify(snapshot())}\n\n`); req.on('close',()=>streams.delete(res)); return;
@@ -66,21 +69,27 @@ export function createApp({ database = ':memory:', provider = new Simulator() } 
         const download=url.pathname.match(/^\/api\/artifacts\/([^/]+)$/);
         if(req.method==='GET' && download){const saved=store.artifact(download[1]);if(!saved)return reply(404,{error:'Artifact not found.'});res.setHeader('Content-Type','application/octet-stream');res.setHeader('Content-Disposition','attachment; filename="artifact.bin"');res.end(Buffer.from(saved.data,'base64'));return;}
         if (req.method !== 'POST') return reply(404,{error:'Route not found.'});
-        let body = ''; for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body)>8192) return reply(413,{error:'Request too large.'}); }
-        const input = JSON.parse(body);
+        // Decode once at the end: a chunk boundary can split a multi-byte character.
+        const parts = []; let size = 0; for await (const chunk of req) { size += chunk.length; if (size>8192) return reply(413,{error:'Request too large.'}); parts.push(chunk); }
+        const input = JSON.parse(Buffer.concat(parts).toString());
         await serial(async () => {
           if (url.pathname === '/api/workers') {
             const spec=workerInput(input);
             const key=String(req.headers['idempotency-key']??'');
             if(provider.mode==='aws'&&!/^[a-zA-Z0-9-]{8,100}$/.test(key))throw Error('A stable idempotency key is required for AWS launch.');
             const fingerprint=createHash('sha256').update(JSON.stringify(spec)).digest('hex');
-            const prior=key&&store.list().find(w=>w.requestKey===key);
+            // A launch refused before submission (`failed`) created nothing, so its key may launch again.
+            const prior=key&&store.list().find(w=>w.requestKey===key&&w.state!=='failed');
             if(prior){if(prior.fingerprint!==fingerprint)throw Error('Launch key reused with different input.');return reply(200,prior);}
-            if(store.list().filter(w=>!['terminated','failed'].includes(w.state)).length>=maxWorkers)return reply(409,{error:'Worker limit reached. Terminate a worker first.'});
+            if(activeCount(store.list())>=maxWorkers)return reply(409,{error:'Worker limit reached. Terminate a worker first.'});
             let worker=provider.prepare?.(spec);
+            // Retrying a launch refused before submission reuses its record, so retries do not pile up failed rows.
+            const refused=key&&store.list().find(w=>w.requestKey===key&&w.state==='failed'&&w.fingerprint===fingerprint);
+            if(worker&&refused)worker={...worker,id:refused.id,requestId:refused.requestId};
             if(worker){worker={...worker,requestKey:key,fingerprint};store.save(worker,'AWS launch reserved. Reconcile uncertain outcomes before retrying.');broadcast();}
             try {worker=await provider.create(spec,worker);}
             catch(error){if(worker){store.save({...worker,state:error.notSubmitted?'failed':'unknown'},error.notSubmitted?'AWS preflight failed before launch.':'AWS launch outcome unknown. Reconcile before launching again.');broadcast();}throw error;}
+            if(key&&!worker.requestKey)worker={...worker,requestKey:key,fingerprint};
             store.save(worker,provider.mode==='aws'?'AWS launch accepted. Independent expiration applies.':'Simulated worker created. No cloud resources or commands were started.'); broadcast(); return reply(201,worker);
           }
           const sessionRoute=url.pathname.match(/^\/api\/workers\/([^/]+)\/terminals(?:\/([^/]+)\/(resume|close))?$/);
@@ -96,7 +105,7 @@ export function createApp({ database = ':memory:', provider = new Simulator() } 
             if(prior){if(prior.fingerprint!==fingerprint)throw Error('Command request key reused.');return reply(200,prior);}
             let record={id:key,workerId:worker.id,fingerprint,status:'Unknown',createdAt:new Date().toISOString()};store.saveCommand(record);
             try {record={...record,...await provider.execute(worker,input.command)};store.saveCommand(record);store.save(worker,'SSM command submitted.');broadcast();return reply(202,record);}
-            catch(error){store.save(worker,'SSM command outcome unknown. It will not be automatically resent.');broadcast();throw error;}
+            catch(error){if(error.notSubmitted){store.deleteCommand(key);store.save(worker,'SSM command was not submitted.');}else store.save(worker,'SSM command outcome unknown. It will not be automatically resent.');broadcast();throw error;}
           }
           const commandAction=url.pathname.match(/^\/api\/commands\/([^/]+)\/(refresh|cancel)$/);
           if(commandAction){
@@ -114,11 +123,17 @@ export function createApp({ database = ':memory:', provider = new Simulator() } 
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') return reply(405,{error:'Method not allowed.'});
     let pathname; try { pathname = decodeURIComponent(url.pathname); } catch { return reply(400,{error:'Invalid path.'}); }
-    const base = resolve(root,'dist'); const path = resolve(base, '.' + (pathname === '/' ? '/index.html' : pathname));
+    // `/site/` serves the static project website (setup guide) so the dashboard can link to it.
+    // Bare `/site` redirects so the site's relative links resolve under `/site/`.
+    if (pathname === '/site') { res.writeHead(308,{Location:'/site/'}); return res.end(); }
+    const site = pathname.startsWith('/site/'), base = site ? siteDir : resolve(root, 'dist');
+    const rel = site ? pathname.slice(5) : pathname;
+    // A root resolves to `base` itself, which the containment check would refuse (403): use its index.
+    const path = resolve(base, '.' + (rel === '/' ? '/index.html' : rel));
     if (!path.startsWith(base+'/')) return reply(403,{error:'Invalid path.'});
     try {
       const content = readFileSync(path);
-      res.setHeader('Content-Type',({'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml'})[extname(path)] || 'application/octet-stream');
+      res.setHeader('Content-Type',({'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.png':'image/png'})[extname(path)] || 'application/octet-stream');
       res.end(req.method === 'HEAD' ? undefined : content);
     } catch { reply(404,{error:'File not found. Run npm run build before starting.'}); }
   });
